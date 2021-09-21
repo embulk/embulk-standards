@@ -52,6 +52,18 @@ public class TestCsvGuessPlugin {
         assertEquals("string", columnsActual.get(1).get("type"));
     }
 
+    @Test
+    public void testQuotedString() {
+        final ConfigDiff actual = guess(
+                "\"quoted_string\"",
+                "\"example_string\"");
+        final List<Map> columnsActual = (List<Map>) actual.getNested("parser").get(List.class, "columns");
+        assertEquals(1, columnsActual.size());
+        assertEquals(2, columnsActual.get(0).size());
+        assertEquals("c0", columnsActual.get(0).get("name"));
+        assertEquals("string", columnsActual.get(0).get("type"));
+    }
+
     /*
   class TestDelimiter < self
     data(
