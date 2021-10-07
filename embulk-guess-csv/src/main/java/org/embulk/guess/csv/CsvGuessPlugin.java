@@ -29,13 +29,17 @@ import java.util.stream.IntStream;
 import java.util.stream.StreamSupport;
 import org.embulk.config.ConfigDiff;
 import org.embulk.config.ConfigSource;
-import org.embulk.parser.csv.CsvParserPlugin;
-import org.embulk.parser.csv.CsvTokenizer;
 import org.embulk.spi.Buffer;
 import org.embulk.spi.BufferAllocator;
 import org.embulk.spi.Exec;
 import org.embulk.spi.GuessPlugin;
 import org.embulk.util.config.ConfigMapperFactory;
+import org.embulk.util.csv.CsvTokenizer;
+import org.embulk.util.csv.QuotedFieldLengthLimitExceededException;
+import org.embulk.util.csv.RecordDoesNotHaveExpectedColumnException;
+import org.embulk.util.csv.RecordHasUnexpectedRemainingColumnException;
+import org.embulk.util.csv.UnexpectedCharacterAfterQuoteException;
+import org.embulk.util.csv.UnexpectedEndOfLineInQuotedFieldException;
 import org.embulk.util.file.ListFileInput;
 import org.embulk.util.guess.CharsetGuess;
 import org.embulk.util.guess.GuesstimatedType;
@@ -43,6 +47,7 @@ import org.embulk.util.guess.LineGuessHelper;
 import org.embulk.util.guess.NewlineGuess;
 import org.embulk.util.guess.SchemaGuess;
 import org.embulk.util.text.LineDecoder;
+import org.embulk.util.text.LineDelimiter;
 import org.embulk.util.text.Newline;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -285,19 +290,11 @@ public class CsvGuessPlugin implements GuessPlugin {
             final Boolean trimIfNotQuoted,
             final BufferAllocator bufferAllocator) {
         try {
+            final Newline newline = parserConfig.get(Newline.class, "newline", Newline.CRLF);
             final String nullString = parserConfig.get(String.class, "null_string", null);
-            final ConfigSource config = CONFIG_MAPPER_FACTORY.newConfigSource();
-            config.merge(parserConfig);
-            if (trimIfNotQuoted != null) {
-                config.set("trim_if_not_quoted", (boolean) trimIfNotQuoted);
-            }
-            config.set("charset", "UTF-8");
-            config.set("columns", new ArrayList<>());
+            final LineDelimiter lineDelimiterRecognized = parserConfig.get(LineDelimiter.class, "line_delimiter_recognized", null);
 
-            final CsvParserPlugin.PluginTask parserTask =
-                    CONFIG_MAPPER_FACTORY.createConfigMapper().map(config, CsvParserPlugin.PluginTask.class);
-
-            final byte[] data = joinBytes(sampleLines, parserTask.getNewline());
+            final byte[] data = joinBytes(sampleLines, newline);
             final Buffer sample = bufferAllocator.allocate(data.length);
             sample.setBytes(0, data, 0, data.length);
             sample.limit(data.length);
@@ -306,33 +303,40 @@ public class CsvGuessPlugin implements GuessPlugin {
             listBuffer.add(sample);
             final ArrayList<ArrayList<Buffer>> listListBuffer = new ArrayList<>();
             listListBuffer.add(listBuffer);
-            final LineDecoder decoder = LineDecoder.of(
-                    new ListFileInput(listListBuffer), parserTask.getCharset(), parserTask.getLineDelimiterRecognized().orElse(null));
-            final CsvTokenizer tokenizer = new CsvTokenizer(decoder, parserTask);
+            final ListFileInput fileInput = new ListFileInput(listListBuffer);
+            final LineDecoder decoder = LineDecoder.of(fileInput, StandardCharsets.UTF_8, lineDelimiterRecognized);
+
+            final CsvTokenizer tokenizer = buildCsvTokenizer(decoder, parserConfig, trimIfNotQuoted);
 
             final ArrayList<List<String>> rows = new ArrayList<>();
-            while (tokenizer.nextFile()) {
-                while (tokenizer.nextRecord(skipEmptyLines)) {
-                    try {
+            while (fileInput.nextFile()) {
+                try {
+                    while (tokenizer.nextRecord(skipEmptyLines)) {
                         final ArrayList<String> columns = new ArrayList<>();
                         while (true) {
                             try {
-                                final String column = tokenizer.nextColumn();
+                                final String column;
+                                try {
+                                    column = tokenizer.nextColumn();
+                                } catch (final QuotedFieldLengthLimitExceededException | UnexpectedEndOfLineInQuotedFieldException | UnexpectedCharacterAfterQuoteException ex) {
+                                    rows.add(Collections.unmodifiableList(columns));
+                                    break;
+                                }
                                 final boolean quoted = tokenizer.wasQuotedColumn();
                                 if (nullString != null && !quoted && nullString.equals(column)) {
                                     columns.add(null);
                                 } else {
                                     columns.add(column);
                                 }
-                            } catch (final CsvTokenizer.TooFewColumnsException ex) {
+                            } catch (final RecordDoesNotHaveExpectedColumnException ex) {
                                 rows.add(Collections.unmodifiableList(columns));
                                 break;
                             }
                         }
-                    } catch (final CsvTokenizer.InvalidValueException ex) {
-                        // TODO warning
-                        tokenizer.skipCurrentLine();
                     }
+                } catch (final RecordHasUnexpectedRemainingColumnException ex) {
+                    // TODO warning
+                    tokenizer.skipCurrentLine();
                 }
             }
             return Collections.unmodifiableList(rows);
@@ -541,6 +545,59 @@ public class CsvGuessPlugin implements GuessPlugin {
             }
         }
         return false;
+    }
+
+    private static CsvTokenizer buildCsvTokenizer(
+            final LineDecoder decoder,
+            final ConfigDiff parserConfig,
+            final Boolean trimIfNotQuoted) {
+        final String delimiter = parserConfig.get(String.class, "delimiter", ",");
+        final String quote = parserConfig.get(String.class, "quote", null);
+        final String escape = parserConfig.get(String.class, "escape", null);
+        final Newline newline = parserConfig.get(Newline.class, "newline", Newline.CRLF);
+        final String quotesInQuotedFields = parserConfig.get(String.class, "quotes_in_quoted_fields", null);
+        final long maxQuotedSizeLimit = parserConfig.get(long.class, "max_quoted_size_limit", 131072L);
+        final String commentLineMarker = parserConfig.get(String.class, "comment_line_marker", null);
+        final String nullString = parserConfig.get(String.class, "null_string", null);
+
+        final CsvTokenizer.Builder builder = CsvTokenizer.builder(delimiter);
+        if (trimIfNotQuoted != null && ((boolean) trimIfNotQuoted)) {
+            builder.enableTrimIfNotQuoted();
+        } else if (parserConfig.get(boolean.class, "trim_if_not_quoted", false)) {
+            builder.enableTrimIfNotQuoted();
+        }
+
+        if (quote == null) {
+            builder.noQuote();
+        } else {
+            assert quote.length() == 1;
+            builder.setQuote(quote.charAt(0));
+        }
+
+        if (escape == null) {
+            builder.noEscape();
+        } else {
+            assert escape.length() == 1;
+            builder.setEscape(escape.charAt(0));
+        }
+
+        builder.setNewline(newline.getString());
+
+        if ("ACCEPT_STRAY_QUOTES_ASSUMING_NO_DELIMITERS_IN_FIELDS".equals(quotesInQuotedFields)) {
+            builder.acceptStrayQuotesAssumingNoDelimitersInFields();
+        }
+
+        builder.setMaxQuotedFieldLength(maxQuotedSizeLimit);
+
+        if (commentLineMarker != null) {
+            builder.setCommentLineMarker(commentLineMarker);
+        }
+
+        if (nullString != null) {
+            builder.setNullString(nullString);
+        }
+
+        return builder.build(decoder.iterator());
     }
 
     private static int sumOfList(final List<Integer> integers) {
