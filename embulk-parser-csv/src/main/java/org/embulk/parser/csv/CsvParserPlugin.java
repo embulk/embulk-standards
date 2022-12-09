@@ -22,14 +22,19 @@ import com.fasterxml.jackson.annotation.JsonValue;
 import java.nio.charset.Charset;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import org.embulk.config.ConfigException;
 import org.embulk.config.ConfigSource;
+import org.embulk.config.TaskReport;
 import org.embulk.config.TaskSource;
 import org.embulk.spi.BufferAllocator;
 import org.embulk.spi.Column;
@@ -311,6 +316,11 @@ public class CsvParserPlugin implements ParserPlugin {
     @Override
     public void run(TaskSource taskSource, final Schema schema,
             FileInput input, PageOutput output) {
+        runThenReturnTaskReport(taskSource, schema, input, output);
+    }
+
+    //@Override  TODO: need to use new embulk-spi version
+    public Optional<TaskReport> runThenReturnTaskReport(TaskSource taskSource, Schema schema, FileInput input, PageOutput output) {
         final PluginTask task = CONFIG_MAPPER_FACTORY.createTaskMapper().map(taskSource, PluginTask.class);
         final TimestampFormatter[] timestampFormatters = newTimestampColumnFormatters(task, task.getSchemaConfig());
         final JsonParser jsonParser = new JsonParser();
@@ -319,6 +329,7 @@ public class CsvParserPlugin implements ParserPlugin {
         final boolean allowExtraColumns = task.getAllowExtraColumns();
         final boolean stopOnInvalidRecord = task.getStopOnInvalidRecord();
         final int skipHeaderLines = task.getSkipHeaderLines();
+        final List<TaskReport> fileTaskReports = new ArrayList<>();
 
         try (final PageBuilder pageBuilder = getPageBuilder(Exec.getBufferAllocator(), schema, output)) {
             while (input.nextFile()) {
@@ -326,6 +337,9 @@ public class CsvParserPlugin implements ParserPlugin {
                         LineDecoder.of(input, task.getCharset(), task.getLineDelimiterRecognized().orElse(null)).iterator());
 
                 final String fileName = input.hintOfCurrentInputFileNameForLogging().orElse("-");
+                long successes = 0;
+                long warnings = 0;
+                Map<String, List<Long>> warningsMap = new HashMap<>(); //key is warning message, value is list of line numbers
 
                 // skip the header lines for each file
                 for (int skipHeaderLineNumber = skipHeaderLines; skipHeaderLineNumber > 0; skipHeaderLineNumber--) {
@@ -446,14 +460,18 @@ public class CsvParserPlugin implements ParserPlugin {
                             }
                         }
                         pageBuilder.addRecord();
-
+                        successes++;
                     } catch (final InvalidCsvFormatException | CsvRecordValidateException e) {
                         String skippedLine = tokenizer.skipCurrentLine();
                         long lineNumber = tokenizer.getCurrentLineNumber();
                         if (stopOnInvalidRecord) {
                             throw new DataException(String.format("Invalid record at %s:%d: %s", fileName, lineNumber, skippedLine), e);
                         }
-                        logger.warn(String.format("Skipped line %s:%d (%s): %s", fileName, lineNumber, e.getMessage(), skippedLine));
+                        final String warningMsg = e.getMessage();
+                        logger.warn(String.format("Skipped line %s:%d (%s): %s", fileName, lineNumber, warningMsg, skippedLine));
+                        warnings++;
+                        warningsMap.computeIfAbsent(warningMsg, w -> new ArrayList<>()).add(lineNumber);
+
                         //exec.notice().skippedLine(skippedLine);
 
                         hasNextRecord = tokenizer.nextRecord();
@@ -463,10 +481,12 @@ public class CsvParserPlugin implements ParserPlugin {
                         break;
                     }
                 }
+                fileTaskReports.add(CONFIG_MAPPER_FACTORY.newTaskReportPerFileParserPlugin(fileName, successes, warnings, warningsMap));
             }
 
             pageBuilder.finish();
         }
+        return CONFIG_MAPPER_FACTORY.newTaskReportParserPlugin(fileTaskReports);
     }
 
     static class CsvRecordValidateException extends DataException {
