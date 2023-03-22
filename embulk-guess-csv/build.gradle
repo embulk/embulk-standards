@@ -19,9 +19,9 @@ dependencies {
     compileOnly "org.embulk:embulk-api:0.10.33"
     compileOnly "org.embulk:embulk-spi:0.10.33"
 
-    compile project(":embulk-parser-csv")
-    compile "com.ibm.icu:icu4j:54.1.1"
-    compile "org.embulk:embulk-util-guess:0.2.0"
+    implementation project(":embulk-parser-csv")
+    implementation "com.ibm.icu:icu4j:54.1.1"
+    implementation "org.embulk:embulk-util-guess:0.2.0"
 
     testImplementation "junit:junit:4.13.2"
     testImplementation "org.embulk:embulk-api:0.10.33"
